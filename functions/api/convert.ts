@@ -28,9 +28,6 @@ function sanitizeFilename(name: string) {
 }
 
 function normalizeHour(ts: string) {
-  // SBV can be "0:00:02.000" or "00:00:02.000"
-  // Make it always HH:MM:SS.mmm
-  // If it matches H:MM:SS.mmm → pad to 2-digit hour.
   const m = ts.match(/^(\d+):(\d{2}):(\d{2}\.\d{3})$/);
   if (!m) return ts;
   const h = m[1].padStart(2, "0");
@@ -43,47 +40,107 @@ function escapeHtml(s: string) {
   }[c] as string));
 }
 
+function escapeRegex(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * We want "whole word / whole phrase" matches, not substrings.
+ * Define a "word character" as any Unicode letter or digit.
+ * Boundary = start/end OR a non-letter/digit around the match.
+ *
+ * Note: JS supports Unicode property escapes with /u.
+ */
+const WORD_CH = String.raw`[\p{L}\p{N}]`;
+const NOT_WORD_CH = String.raw`[^\p{L}\p{N}]`;
+
+/**
+ * Build one regex that matches ANY phrase/word from the italics list,
+ * but only when it is bounded by non-word chars (or start/end).
+ *
+ * We use a capturing group for the match itself, and keep the left boundary
+ * so we can re-emit it unchanged.
+ *
+ * Pattern shape:
+ *   (^|NOT_WORD)(PHRASE1|PHRASE2|...)(?=$|NOT_WORD)
+ *
+ * We also collapse whitespace inside phrases to match flexible spaces:
+ * "Manduky   Upanishad" in text should match "Manduky Upanishad" in list.
+ */
+function buildItalicsRegex(phrases: string[]): RegExp | null {
+  if (!phrases.length) return null;
+
+  // longest-first so phrases win over smaller words
+  const sorted = [...phrases].sort((a, b) => b.length - a.length);
+
+  const alts = sorted.map(p => {
+    // trim and normalize internal whitespace in the phrase to \s+
+    const norm = p.trim().replace(/\s+/g, String.raw`\s+`);
+    return escapeRegex(norm)
+      // escapeRegex also escaped \s+ we inserted, so undo that:
+      .replace(/\\s\+/g, String.raw`\s+`);
+  });
+
+  const pattern = String.raw`(^|${NOT_WORD_CH})(${alts.join("|")})(?=$|${NOT_WORD_CH})`;
+  return new RegExp(pattern, "giu"); // g=global, i=case-insensitive, u=unicode
+}
+
 function buildItalicsList(italicsText: string): string[] {
-  const lines = italicsText
+  return italicsText
     .split(/\r?\n/)
     .map(s => s.trim())
     .filter(Boolean);
-
-  // Sort longest first to avoid partial overlap issues
-  lines.sort((a, b) => b.length - a.length);
-  return lines;
 }
 
-function italicizeLine(line: string, phrases: string[]): string {
-  if (!phrases.length) return escapeHtml(line);
+/**
+ * Italicize only whole-word/whole-phrase matches.
+ * Also: avoid double-italicizing by doing everything in ONE regex pass.
+ *
+ * Steps:
+ * 1) HTML-escape the full line (to avoid accidental HTML injection)
+ * 2) Run italics regex over the *escaped line* but we must match phrases
+ *    against the visible text, not against escape sequences.
+ *
+ * To keep it simple & robust:
+ * - We do matching on the raw line
+ * - We build an output string with safe escaping for non-matched parts,
+ *   and <i>...</i> for matched parts.
+ */
+function italicizeLineWholeWords(rawLine: string, italicsRe: RegExp | null): string {
+  if (!italicsRe) return escapeHtml(rawLine);
+  italicsRe.lastIndex = 0;
 
-  // Escape first; we’ll insert <i> tags into escaped content by mapping indices on the *original* string.
-  // Simpler (and good enough for subtitles): do replacement on original, then escape non-tag parts.
-  // Approach: build segments using regex with case-insensitive match, one phrase at a time.
-  let out = line;
+  let out = "";
+  let last = 0;
 
-  for (const phrase of phrases) {
-    // Escape regex special chars in phrase
-    const escapedPhrase = phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(escapedPhrase, "gi");
+  // We match on the RAW line, but we need to preserve group(1) boundary char.
+  // match[0] includes boundary + phrase; group1 is boundary; group2 is phrase.
+  for (const match of rawLine.matchAll(italicsRe)) {
+    const full = match[0] ?? "";
+    const leftBoundary = match[1] ?? "";
+    const phrase = match[2] ?? "";
 
-    // Avoid double-wrapping: don’t replace inside existing tags by checking a quick heuristic
-    // (good enough here; subtitles rarely contain HTML to begin with)
-    out = out.replace(re, (m) => `<i>${m}</i>`);
+    const startIdx = match.index ?? 0;
+    // full match starts at startIdx; phrase starts after leftBoundary
+    const phraseStart = startIdx + leftBoundary.length;
+    const phraseEnd = phraseStart + phrase.length;
+
+    // append text before the match
+    out += escapeHtml(rawLine.slice(last, phraseStart));
+
+    // wrap the phrase
+    out += `<i>${escapeHtml(rawLine.slice(phraseStart, phraseEnd))}</i>`;
+
+    last = phraseEnd;
   }
 
-  // Now escape everything except the <i> tags we inserted.
-  // Convert to a safe form by temporarily protecting tags.
-  const tokenI0 = "___I_OPEN___";
-  const tokenI1 = "___I_CLOSE___";
-  out = out.replace(/<i>/g, tokenI0).replace(/<\/i>/g, tokenI1);
-  out = escapeHtml(out);
-  out = out.replaceAll(tokenI0, "<i>").replaceAll(tokenI1, "</i>");
+  // append remainder
+  out += escapeHtml(rawLine.slice(last));
 
   return out;
 }
 
-function sbvToVtt(sbvText: string, italicsPhrases: string[]) {
+function sbvToVtt(sbvText: string, italicsRe: RegExp | null) {
   const lines = sbvText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
   let vtt = "WEBVTT\n\n";
@@ -92,13 +149,10 @@ function sbvToVtt(sbvText: string, italicsPhrases: string[]) {
   while (i < lines.length) {
     const timeLine = lines[i]?.trim();
 
-    // skip empty lines
     if (!timeLine) { i++; continue; }
 
-    // time line: "0:00:00.000,0:00:02.000"
     const tm = timeLine.match(/^(.+?),(.+?)$/);
     if (!tm) {
-      // If malformed, just skip this line
       i++;
       continue;
     }
@@ -107,17 +161,17 @@ function sbvToVtt(sbvText: string, italicsPhrases: string[]) {
     const end = normalizeHour(tm[2].trim());
     i++;
 
-    // collect text lines until blank line
     const cueLines: string[] = [];
     while (i < lines.length && lines[i].trim() !== "") {
       cueLines.push(lines[i]);
       i++;
     }
 
-    // skip the blank separator
     while (i < lines.length && lines[i].trim() === "") i++;
 
-    const processed = cueLines.map(l => italicizeLine(l, italicsPhrases)).join("\n");
+    const processed = cueLines
+      .map(l => italicizeLineWholeWords(l, italicsRe))
+      .join("\n");
 
     vtt += `${start} --> ${end}\n${processed}\n\n`;
   }
@@ -143,7 +197,8 @@ export async function onRequest(context: any): Promise<Response> {
 
   const italicsText = typeof body.italicsText === "string" ? body.italicsText : "";
   const phrases = buildItalicsList(italicsText);
+  const italicsRe = buildItalicsRegex(phrases);
 
-  const vtt = sbvToVtt(sbvText, phrases);
+  const vtt = sbvToVtt(sbvText, italicsRe);
   return vttResponse(vtt, body.outputName || "captions.vtt");
 }
