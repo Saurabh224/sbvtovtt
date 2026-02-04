@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SBV → VTT Converter</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 980px; margin: 24px auto; padding: 0 16px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; }
+    label { display:block; font-size:14px; margin-bottom:6px; }
+    input[type="file"], input[type="text"] { padding: 8px; }
+    textarea { width: 100%; min-height: 160px; padding: 10px; font-family: ui-monospace, monospace; }
+    button { padding: 10px 14px; cursor:pointer; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:14px; margin-top:16px; }
+    .muted { color:#666; font-size:13px; }
+    .error { color:#b00020; white-space:pre-wrap; }
+    .ok { color:#0a7a2f; }
+  </style>
+</head>
+<body>
+  <h1>SBV → VTT Converter (with italics list)</h1>
+  <p class="muted">Upload an <b>.sbv</b>, provide an italics list (one phrase per line), then download the generated <b>.vtt</b>.</p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>SBV file</label>
+        <input id="sbvFile" type="file" accept=".sbv,text/plain">
+      </div>
+
+      <div>
+        <label>Italics list file (optional)</label>
+        <input id="italicsFile" type="file" accept=".txt,text/plain">
+      </div>
+
+      <div style="flex:1; min-width:220px">
+        <label>Output filename</label>
+        <input id="outName" type="text" value="captions.vtt" style="width:100%">
+      </div>
+
+      <div>
+        <button id="convertBtn">Convert & Download</button>
+      </div>
+    </div>
+
+    <p class="muted" style="margin-top:10px">
+      If you don’t upload an italics file, paste phrases below (one per line). Matching is case-insensitive.
+    </p>
+
+    <label for="italicsText">Italics phrases (one per line)</label>
+    <textarea id="italicsText" placeholder="Manduky Upanishad&#10;The cause of of desires"></textarea>
+  </div>
+
+  <div id="status" class="card" style="display:none"></div>
+
+  <script>
+    const API_URL = "/api/convert";
+
+    const sbvFile = document.getElementById("sbvFile");
+    const italicsFile = document.getElementById("italicsFile");
+    const italicsText = document.getElementById("italicsText");
+    const outName = document.getElementById("outName");
+    const convertBtn = document.getElementById("convertBtn");
+    const status = document.getElementById("status");
+
+    function show(html) { status.style.display="block"; status.innerHTML = html; }
+
+    convertBtn.addEventListener("click", async () => {
+      status.style.display="none";
+
+      const f = sbvFile.files && sbvFile.files[0];
+      if (!f) { show(`<p class="error">Please select an .sbv file.</p>`); return; }
+
+      show(`<p>Reading SBV…</p>`);
+      const sbvText = await f.text();
+
+      // italics list: prefer uploaded file, else textarea
+      let italics = italicsText.value || "";
+      const itFile = italicsFile.files && italicsFile.files[0];
+      if (itFile) italics = await itFile.text();
+
+      show(`<p>Converting…</p>`);
+
+      try {
+        const resp = await fetch(API_URL, {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({
+            sbvText,
+            italicsText: italics,
+            outputName: outName.value || "captions.vtt"
+          })
+        });
+
+        if (!resp.ok) {
+          const t = await resp.text();
+          show(`<p class="error">Server error (HTTP ${resp.status}):\n${t}</p>`);
+          return;
+        }
+
+        const blob = await resp.blob();
+        const filename = (outName.value || "captions.vtt").trim();
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+
+        show(`<p class="ok">✅ Done. Download started: <b>${filename}</b></p>`);
+      } catch (e) {
+        show(`<p class="error">Fetch failed:\n${String(e)}</p>`);
+      }
+    });
+  </script>
+</body>
+</html>
